@@ -215,7 +215,7 @@ class NavGrid:
 
 
 class Bot:
-    name = 'Bizz01-Aegis-v1'
+    name = 'Bizz01-Aegis-v2'
 
     def __init__(self, hello: mf.Hello):
         self.config = hello['config']
@@ -230,6 +230,7 @@ class Bot:
         self.jet_until = 0.0
         self.orbit_dir = -1 if hello.get('slot', 0) % 2 else 1
         self.last_enemy = None
+        self.scan_phase = 0
 
     def choose_upgrade(self, choices, hp_ratio, weapons):
         base = {
@@ -263,7 +264,7 @@ class Bot:
                        (outside_future and (time_to_shrink < (distn - nr + safe_margin) / speed + 22
                                             or nr < 130)))
         near_enemy = min((d2(here, m['pos']) for m in enemies), default=1e6)
-        high_threat = near_enemy < (100 if me['hp'] < .55 * me['max_hp'] else 75)
+        high_threat = near_enemy < (140 if me['hp'] < .60 * me['max_hp'] else 105) or sum(d2(here, e['pos']) < 150 for e in enemies) >= 2
 
         # Opposite the hostile pack is safer than a predictable center-camping point.
         ax, ay, total = 0.0, 0.0, 0.0
@@ -484,7 +485,7 @@ class Bot:
                 self.route_at = -100
             self.last_pos = (x, y, t)
         energy = me['energy']
-        urgent_boost = zone_urgent or not me['in_zone'] or (threat and hp_ratio < .76) or bool(dodge_x or dodge_y)
+        urgent_boost = zone_urgent or not me['in_zone'] or (threat and (hp_ratio < .92 or len(enemies) > 1)) or bool(dodge_x or dodge_y)
         boost = (energy > (11 if not me['in_zone'] else 25) and
                  (urgent_boost or (goal_type in ('weapon', 'cube', 'drop') and energy > 75 and d2(goal, here) > 40)))
         jet = t < self.jet_until and energy > 17
@@ -493,83 +494,94 @@ class Bot:
         if me['grounded'] and (jet or (threat and energy > 40 and int(t * 2.2) % 13 == 0)):
             act['jump'] = True
 
-        # Aim at highest-value visible target while staying mobile (legs independent of torso).
-        candidates = []
-        for enemy in enemies:
-            distance = d2(here, enemy['pos'])
-            if distance > 245:
-                continue
-            hp = enemy.get('hp', 1400)
-            priority = (125 / (distance + 35) + (1 - hp / 1400) * .65
-                        + (0.25 if distance < 75 else 0))
-            # Prefer a clear firing lane, but visible enemy memory may be behind cover.
-            if self.nav.ok and not self.nav.clear(here, enemy['pos']):
-                priority *= .45
-            candidates.append((priority, enemy))
-        can_farm = (not enemies or d2(here, enemies[0]['pos']) > 95) and not zone_urgent
-        if can_farm:
+        # Placement-first combat policy. Shooting resets health regeneration; don't
+        # trade shots at long range just because an enemy appears in the sensor list.
+        # Only defend against immediate threats, punish very weak targets, or farm
+        # crates/NPCs when safe. ALL weapon slots share one commanded torso aim.
+        nearest = d2(here, enemies[0]['pos']) if enemies else 1e6
+        hostile = None
+        if enemies:
+            for enemy in enemies:
+                dist = d2(here, enemy['pos'])
+                exposed = not self.nav.ok or self.nav.clear(here, enemy['pos'])
+                weak = enemy.get('hp', 1400) < 240
+                if exposed and (dist < (64 if hp_ratio < .48 else 92) or (weak and dist < 125)):
+                    hostile = enemy
+                    break
+        can_farm = nearest > 145 and not zone_urgent and hp_ratio >= .80 and me['in_zone']
+        target = hostile
+        if target is None and can_farm:
+            farm = []
             for npc in obs['mechs']:
-                if npc['kind'] != 'npc':
-                    continue
-                distance = d2(here, npc['pos'])
-                if distance < 130 and (not self.nav.ok or self.nav.clear(here, npc['pos'])):
-                    candidates.append((.65 + 65 / (distance + 45), npc))
+                if npc['kind'] == 'npc':
+                    distance = d2(here, npc['pos'])
+                    if 18 < distance < 100 and (not self.nav.ok or self.nav.clear(here, npc['pos'])):
+                        farm.append((distance - 12, npc))
             for crate in obs['crates']:
                 distance = d2(here, crate['pos'])
-                if distance < 95 and (not self.nav.ok or self.nav.clear(here, crate['pos'])):
+                if distance < 90 and (not self.nav.ok or self.nav.clear(here, crate['pos'])):
                     c = {'kind': 'crate', 'pos': crate['pos'], 'vel': [0, 0, 0], 'hp': crate['hp'], 'id': crate['id']}
-                    candidates.append((.4 + 30 / (distance + 55), c))
-        target = max(candidates, key=lambda row: row[0])[1] if candidates else None
-        if target:
+                    farm.append((distance, c))
+            if farm:
+                target = min(farm, key=lambda x: x[0])[1]
+
+        w0, w1 = me['weapons']
+        if target is not None:
             distance = d2(here, target['pos'])
-            weapon0 = me['weapons'][0]
-            if weapon0 and weapon0['kind'] == 'gun' and distance < weapon0['stats'].get('range', 230) - 5:
-                aim = self.aim_at(me, target, 'gun', distance)
-                if aim:
-                    act['aim'] = [round(aim[0], 5), round(aim[1], 5)]
-                    yaw_gap = abs(angle_delta(aim[0], me['aim'][0]))
-                    pitch_gap = abs(aim[1] - me['aim'][1])
-                    act['fire'][0] = yaw_gap < .095 and pitch_gap < .1
-            weapon1 = me['weapons'][1]
-            if weapon1:
-                kind = weapon1['kind']
-                aim = self.aim_at(me, target, kind, distance)
-                if aim:
-                    yaw_gap = abs(angle_delta(aim[0], me['aim'][0]))
-                    pitch_gap = abs(aim[1] - me['aim'][1])
-                    is_hostile = target['kind'] == 'mech'
-                    if kind == 'laser' and distance < weapon1['stats'].get('range', 280) - 5:
-                        charge = weapon1.get('charge', 0)
-                        charge_goal = weapon1['stats'].get('charge', .75)
-                        if (is_hostile or target['kind'] == 'npc') and (not threat or hp_ratio > .70):
-                            act['aim'] = [round(aim[0], 5), round(aim[1], 5)]
-                            act['fire'][1] = charge < charge_goal * .94 or yaw_gap > .10 or pitch_gap > .1
-                            if charge > charge_goal * 1.28:
-                                act['fire'][1] = False
-                    elif kind == 'lightning' and distance < weapon1['stats'].get('range', 45) - 2:
-                        if is_hostile or target['kind'] == 'npc':
-                            act['aim'] = [round(aim[0], 5), round(aim[1], 5)]
-                            act['fire'][1] = yaw_gap < .22 and energy >= (5 if hp_ratio > .5 else 24)
-                    elif kind == 'mortar' and distance > 25 and distance < 210:
-                        if is_hostile or (can_farm and target['kind'] == 'npc'):
-                            act['aim'] = [round(aim[0], 5), round(aim[1], 5)]
-                            act['fire'][1] = yaw_gap < .075 and pitch_gap < .095
-            if weapon0 and weapon0['kind'] == 'gun' and weapon0.get('ammo', 12) <= 2:
-                act['reload'] = True
+            is_hostile = target['kind'] == 'mech'
+            # Prefer precision hitscan at distance; mortar when in a safe firing
+            # band; gun when second weapon can't be used. Laser and gun must not
+            # both shoot at different pitch solutions in the same decision.
+            secondary = None
+            if w1:
+                kind = w1['kind']
+                if (kind == 'laser' and distance < w1['stats'].get('range', 280) - 5
+                        and target['kind'] != 'crate' and (not threat or hp_ratio > .70)):
+                    secondary = kind
+                elif kind == 'lightning' and distance < min(42, w1['stats'].get('range', 45) - 2) and energy > 7:
+                    secondary = kind
+                elif kind == 'mortar' and 33 < distance < 185 and (is_hostile or target['kind'] == 'npc'):
+                    secondary = kind
+            active_kind = secondary or ('gun' if w0 and w0['kind'] == 'gun' else None)
+            aim = self.aim_at(me, target, active_kind, distance) if active_kind else None
+            if aim:
+                act['aim'] = [round(aim[0], 5), round(aim[1], 5)]
+                yaw_gap = abs(angle_delta(aim[0], me['aim'][0]))
+                pitch_gap = abs(aim[1] - me['aim'][1])
+                aligned = yaw_gap < .07 and pitch_gap < .08
+                if secondary == 'laser':
+                    charge = w1.get('charge', 0)
+                    charge_goal = w1['stats'].get('charge', .75)
+                    # Hold to charge, release only when aligned and substantially
+                    # charged. Automatically release after hold cap.
+                    act['fire'][1] = charge < charge_goal * .98 or not aligned
+                    if charge >= charge_goal * 1.17:
+                        act['fire'][1] = False
+                elif secondary == 'lightning':
+                    act['fire'][1] = yaw_gap < .17 and energy > 7
+                elif secondary == 'mortar':
+                    act['fire'][1] = aligned
+                elif active_kind == 'gun':
+                    act['fire'][0] = aligned and distance < w0['stats'].get('range', 230) - 5
         else:
-            # Face the closest threat even while retreating to protect rear armor.
-            yaw = math.atan2(my, mx) if mx or my else me['aim'][0]
+            # Face a threatening mech to avoid taking rear-armor damage even when
+            # retreating. Otherwise scan in broad arcs to discover safe loot.
             if enemies:
                 e = enemies[0]
                 yaw = math.atan2(e['pos'][1] - y, e['pos'][0] - x)
+            else:
+                yaw = math.atan2(my, mx) if mx or my else me['aim'][0]
+                yaw += 0.55 * math.sin(t * .46)
             act['aim'] = [round(yaw, 5), 0.0]
-            if me['weapons'][0] and me['weapons'][0].get('ammo', 12) < 11:
-                act['reload'] = True
 
-        # Laser release is crucial: release when fully charged even if target just disappeared.
-        w1 = me['weapons'][1]
-        if w1 and w1['kind'] == 'laser' and w1.get('charge', 0) > w1['stats'].get('charge', .75) * 1.08:
-            act['fire'][1] = False
+        # Don't waste energy or risk slowing down for laser charging when fleeing.
+        if w1 and w1['kind'] == 'laser' and w1.get('charge', 0) > 0:
+            if target is None or (threat and hp_ratio < .65):
+                act['fire'][1] = False
+        if w0 and w0['kind'] == 'gun':
+            ammo = w0.get('ammo', 12)
+            if ammo <= 2 or (target is None and ammo < w0['stats'].get('mag', 12)):
+                act['reload'] = True
         return act
 
 
