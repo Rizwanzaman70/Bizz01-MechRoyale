@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import time
 
 import mechfight as mf
 
@@ -1480,5 +1481,180 @@ class V13Bot(V10Bot):
                         break
         return action
 
-Bot=V13Bot
+# V14: retain the two strongest official candidates' damage policies.
+# A second weapon in the opening minute is a major power spike. Cover-route
+# survival is restricted to overwhelming pressure and never cancels shooting.
+class V14Bot(V13Bot):
+    name='Bizz01-Aegis-v14'
+
+    def __init__(self, hello):
+        super().__init__(hello)
+        self.cover_goal=None
+        self.cover_until=-100.
+        self.cover_checked=-100.
+        self.attack_clock=-100.
+        self.front_loaded_hp=float(self.config['mech'].get('hp',1400))
+        self.cover_old_attack=None
+        self.escape_dir=self.orbit_dir
+
+    def fight(self, obs, me, target, act, enemies, near, urgent):
+        super().fight(obs,me,target,act,enemies,near,urgent)
+        if target is None and not enemies and not (obs['t']-self.last_bearing_at<1.6 and self.last_bearing is not None):
+            # 120-degree sight means a 360 scan every ~2s finds nearby loot
+            # much sooner than the previous 6.7-second sweep, without missing
+            # an observation between overlapping sight wedges.
+            rate=3.0 if obs['t']<65 and me['weapons'][1] is None else 1.7
+            if obs['t']>140:rate=1.0
+            act['aim']=[round(angle_delta(obs['t']*rate + self.orbit_dir*.35,0.),6),0.]
+
+    def threat(self, here, height, enemies):
+        # Publicly observed positions, real arena solids. Estimate how many
+        # enemies have direct firing lines to the candidate location.
+        total=0.
+        for e in enemies[:5]:
+            dd=d2(here,e['pos'])
+            if dd>240:continue
+            src=(e['pos'][0],e['pos'][1],e['pos'][2]+7)
+            end=(here[0],here[1],height+4.5)
+            if not self.sight.clear(src,end):continue
+            w=e.get('weapons',[])
+            gun=1.0 if dd<210 else .3
+            lightning=1.15 if 'lightning' in w and dd<52 else 0.
+            laser=.9 if 'laser' in w and dd<250 else 0.
+            closeness=.45 if dd<75 else .10 if dd<140 else 0.
+            total+=gun+lightning+laser+closeness
+        return total
+
+    def cover_destination(self,obs,me,enemies,near,urgent,deadline):
+        t=obs['t'];here=me['pos'];hp=me['hp']/max(1,me['max_hp'])
+        if urgent or not me['grounded'] or not me['in_zone'] or self.capture_lock is not None:
+            self.cover_goal=None;return None
+        close=[e for e in enemies if d2(here,e['pos'])<150]
+        under_fire=t-self.attack_clock<3.
+        critical=(hp<.47 and (near<155 or under_fire))
+        surrounded=(len(close)>=2 and hp<.79) or (len(close)>=3 and near<125)
+        # Do not divert from securing a kill that is already within a shot.
+        finishing=any(e.get('hp',1400)<150 and d2(here,e['pos'])<108
+                       and self.visible_to_shoot(me,e) for e in enemies)
+        if not (critical or surrounded) or (finishing and hp>.34):
+            self.cover_goal=None;return None
+        if self.new_objective and self.new_objective[3] in ('weapon','cube','drop'):
+            if d2(here,self.new_objective[2])<11 and near>48:return None
+        if self.cover_goal is not None and t>=self.cover_until:
+            self.cover_goal=None
+        if self.cover_goal and t<self.cover_until:
+            if d2(here,self.cover_goal)>9 and self.nav.clear(here,self.cover_goal):
+                return self.cover_goal
+            self.cover_goal=None
+        if t-self.cover_checked<1.25:return None
+        self.cover_checked=t
+        current=self.threat(here,here[2],enemies)
+        if current<.9:return None
+        zone=obs['zone'];cx,cy=zone['next_center'];radius=zone['next_radius']
+        allowed=max(10,radius-min(28,radius*.14))
+        if not self.nav.ok:return None
+        avx,avy=0.,0.
+        for e in enemies[:4]:
+            dist=d2(here,e['pos']);dx,dy=norm(here[0]-e['pos'][0],here[1]-e['pos'][1])
+            wt=1./max(30,dist)
+            avx+=dx*wt;avy+=dy*wt
+        ang=math.atan2(avy,avx) if avx or avy else 0.
+        candidates=[]
+        for dist in (28.,48.,72.):
+            for i in range(12):
+                a=ang+(i-5.5)*TAU/12
+                point=(here[0]+math.cos(a)*dist,here[1]+math.sin(a)*dist)
+                if d2(point,(cx,cy))>allowed:continue
+                gi,gj=self.nav.ij(*point)
+                if self.nav.grid[gj*self.nav.nx+gi]:continue
+                if not self.nav.clear(here,point):continue
+                gz=self.nav.ground(*point)
+                if abs(gz-here[2])>4.5:continue
+                minenemy=min((d2(point,e['pos']) for e in enemies[:5]),default=999)
+                if minenemy<35:continue
+                # A reachable refuge must not be significantly closer to the
+                # squad or waste much more of the remaining circle.
+                zonecost=max(0.,d2(point,(cx,cy))-d2(here,(cx,cy)))/100.
+                distgain=(minenemy-near)/90.
+                candidates.append((point,gz,distgain,zonecost))
+        candidates.sort(key=lambda x:x[2]-.4*x[3],reverse=True)
+        bestgain=.95;best=None
+        for point,z,distgain,zonecost in candidates[:12]:
+            if time.perf_counter()>deadline:break
+            exposure=self.threat(point,z,enemies)
+            gain=(current-exposure)*1.6+distgain*.40-zonecost*.33
+            if gain>bestgain:
+                bestgain=gain;best=point
+        if best is not None:
+            self.cover_goal=best;self.cover_until=t+3.7
+        return self.cover_goal
+
+    def act(self, obs):
+        started=time.perf_counter()
+        me=obs['self'];t=obs['t'];here=me['pos']
+        if me['hp']<self.front_loaded_hp-3:
+            self.attack_clock=t
+        self.front_loaded_hp=me['hp']
+        action=super().act(obs)
+        enemies=sorted((e for e in obs['mechs'] if e['kind']=='mech'),key=lambda e:d2(here,e['pos']))
+        near=d2(here,enemies[0]['pos']) if enemies else 9999.
+        urgent=self.zone_target(me,obs['zone'],t)[1]
+        # Early equipment rush. At a clean line to a new weapon, boost up to
+        # braking distance, even when the target is only 25-100 metres away.
+        objective=self.new_objective
+        if (objective and objective[3]=='weapon' and me['weapons'][1] is None
+            and t<100 and not urgent and me['grounded'] and me['in_zone']
+            and me['energy']>51 and near>85 and
+            18<d2(here,objective[2])<125 and self.nav.clear(here,objective[2])):
+            action['boost']=True
+        elif (objective and objective[3]=='cube' and t<70 and me['grounded']
+              and me['energy']>78 and near>110 and 40<d2(here,objective[2])<105
+              and self.nav.clear(here,objective[2])):
+            action['boost']=True
+        if enemies:
+            # Leave CPU headroom for the 50ms response budget; A* routing
+            # already consumed most of some costly observations.
+            goal=self.cover_destination(obs,me,enemies,near,urgent,started+.017) if time.perf_counter()-started<.009 else None
+            if goal:
+                dx,dy=norm(goal[0]-here[0],goal[1]-here[1])
+                # Keep shoot/aim unchanged. Dodge takes precedence over any
+                # planned route if a near-term projectile hit is predicted.
+                mv,_=self.dodge(obs,me,(dx,dy))
+                action['move']=[round(mv[0],5),round(mv[1],5)]
+                if me['energy']>43 and d2(here,goal)>22 and me['grounded']:
+                    action['boost']=True
+                action['jump']=False
+            # When several mechs can attack us at once, spending some battery
+            # to open distance is preferable to orbiting inside gunfire.
+            close=sum(d2(here,e['pos'])<105 for e in enemies)
+            if (close>=2 and near<100 and me['grounded'] and me['energy']>31
+                and me['hp']<me['max_hp']*(.58 if close>=3 else .42)
+                and not urgent and self.capture_lock is None):
+                action['boost']=True
+                if not goal and me['hp']<me['max_hp']*.29:
+                    fx,fy=0.,0.
+                    for e in enemies[:5]:
+                        dist=d2(here,e['pos'])
+                        if dist>145:continue
+                        vx,vy=norm(here[0]-e['pos'][0],here[1]-e['pos'][1])
+                        weight=1./max(22,dist)
+                        fx+=vx*weight;fy+=vy*weight
+                    away=norm(fx,fy)
+                    old=action.get('move',[0.,0.])
+                    direction=norm(away[0]*.7+old[0]*.3,away[1]*.7+old[1]*.3)
+                    intended=(here[0]+direction[0]*16,here[1]+direction[1]*16)
+                    if self.nav.clear(here,intended):
+                        action['move']=[round(direction[0],5),round(direction[1],5)]
+            # Defend against a visible laser charge with a perpendicular burst
+            # unless already committed to an urgent zone escape.
+            if (not urgent and me['grounded'] and me['energy']>44 and
+                any(e.get('charging') and d2(here,e['pos'])<210 for e in enemies)):
+                action['boost']=True
+        # Do not cancel a protected drop capture, or fight while attempting a
+        # last-second run into the next zone.
+        if self.capture_lock is not None and me['in_zone'] and near>=55:
+            action['boost']=False;action['jump']=False;action['move']=[0.,0.]
+        return action
+
+Bot=V14Bot
 mf.run(Bot)
