@@ -831,247 +831,226 @@ class Bot:
 
 
 
-
-class AegisV5(Bot):
-    """Aegis v5: v3 combat baseline + resource access, awareness and mobility.
-
-    The practice score is UNKNOWN until submitted to Builders. This agent only
-    uses the map provided by the organizer and its current observation stream.
-    """
-    name = 'Bizz01-Aegis-v5'
+# V6: prioritize early power scaling, sustain damage, and use a health-aware
+# engagement envelope. All inputs are legal observations or arena geometry.
+class V6Bot(Bot):
+    name = 'Bizz01-Aegis-v6'
 
     def __init__(self, hello):
         super().__init__(hello)
-        self.attacker_id = None
-        self.attacker_until = -100.
-        self.alert_yaw = None
-        self.alert_until = -100.
-        self.focus_target = None
-        self.focus_since = -100.
-        self.objective = None
-        self.last_dealt = -100.
-        self.recovery_until = -100.
-        self.cached_move = (0., 0.)
+        self.engage_side = self.orbit_dir
+        self.last_hit_direction = None
+        self.last_hit_time = -100.0
+        self.previous_target = None
+        self.recent_damage = 0.0
+        self.last_clock = 0.0
+        self.current_obs = None
+        self.new_objective = None
 
     def upgrade(self, obs, me):
-        choices = obs.get('offer', {}).get('choices', [])
-        if not choices:
-            return 0
-        hp = me['hp'] / max(1, me['max_hp'])
-        weapon_kinds = {w['kind'] for w in me['weapons'] if w}
-        early = obs['t'] < 150
-        scores = {
-            'nanites': 127 if hp < .96 else 119,
-            'armor': 116 if hp < .65 else 108,
-            'plating': 108 if hp < .76 else 96,
-            'servos': 113 if early else 101,
-            'gun_mag': 116 if early and 'gun' in weapon_kinds else 109,
-            'gun_damage': 110,
-            'gun_rate': 109,
-            'gun_velocity': 82,
-            'laser_charge': 117,
-            'laser_damage': 114,
-            'lightning_range': 105,
-            'lightning_damage': 100,
-            'mortar_reload': 103,
-            'mortar_splash': 94,
-            'jets': 91, 'reactor': 83, 'capacitor': 82,
-            'gyros': 69, 'sensors': 62,
-        }
-        # In late circles survivability scales better than mobility farming.
-        if obs['t'] > 190:
-            scores['armor'] += 7
-            scores['nanites'] -= 8
-            scores['servos'] -= 7
-        if hp < .35:
-            scores['armor'] += 10
-            scores['plating'] += 5
-        return max(range(len(choices)), key=lambda i: scores.get(choices[i].get('id'), 55))
+        choices = obs['offer']['choices']
+        # Sustain wins repeated duels. Larger magazines improve sustained DPS,
+        # plus faster bullets improve accuracy at kiting distance.
+        kinds = {w['kind'] for w in me['weapons'] if w}
+        values = {'nanites':135, 'servos':120, 'plating':114, 'armor':113,
+                  'gun_mag':118, 'gun_damage':112, 'gun_rate':108,
+                  'gun_velocity':103, 'laser_damage':122, 'laser_charge':116,
+                  'lightning_range':121, 'lightning_efficiency':117,
+                  'lightning_chain':88, 'mortar_reload':105, 'mortar_splash':102,
+                  'mortar_velocity':104, 'reactor':91, 'jets':88, 'capacitor':77,
+                  'gyros':80, 'sensors':81}
+        if me['hp'] < me['max_hp']*.55:
+            values['plating'] += 17
+        if 'lightning' in kinds:
+            values['reactor'] += 13
+        return max(range(len(choices)), key=lambda i: values.get(choices[i]['id'],60))
 
     def choose_objective(self, obs, me, enemies, near, zone_urgent):
-        # Avoid impossible rooftop loot. The old 2D navigator routes AROUND
-        # buildings and cannot reliably climb 20-meter rooftops to collect it.
-        z = me['pos'][2]
-        clipped = dict(obs)
-        clipped['cubes'] = [c for c in obs.get('cubes', [])
-                            if abs(c['pos'][2] - z) < 9.0]
-        clipped['pickups'] = [p for p in obs.get('pickups', [])
-                              if abs(p['pos'][2] - z) < 9.0]
-        clipped['crates'] = [c for c in obs.get('crates', [])
-                              if abs(c['pos'][2] - z) < 8.0]
-        # If we're already nearly dead, don't initiate the NPC's aggro.
-        if me['hp'] < .30 * me['max_hp']:
-            clipped['mechs'] = [m for m in obs.get('mechs', []) if m['kind'] != 'npc']
-        result = super().choose_objective(clipped, me, enemies, near, zone_urgent)
-        self.objective = result
-        return result
+        here=me['pos']; t=obs['t']; zone=obs['zone']
+        owned={w['kind'] for w in me['weapons'] if w}
+        hp=me['hp']/max(1,me['max_hp'])
+        opts=[]
+        def add(score, obj, kind, extra=None):
+            p=obj['pos']; d=d2(here,p)
+            # Do not spend the whole early game walking into a rooftop wall.
+            if abs(p[2]-here[2])>5.5 and kind in ('cube','weapon','crate'): return
+            if d2(p,zone['center'])>zone['radius']-4: return
+            if d2(p,zone['next_center'])>zone['next_radius']-4:
+                available=max(0,zone['shrink_end']-t)
+                if available<d/9+20: return
+                score-=30
+            if self.nav.ok and not self.nav.clear(here,p): score-=min(35,10+d*.14)
+            opts.append((score,obj['id'],tuple(p[:2]),kind,extra))
+        for c in obs.get('cubes',[]):
+            d=d2(here,c['pos'])
+            if d>140: continue
+            # Nearby kills must be converted to power rather than abandoned.
+            danger=min((d2(c['pos'],e['pos']) for e in enemies),default=999)
+            add(172-d*1.17+(35 if d<16 else 0)+(15 if me['cubes']<10 else 0)-max(0,35-danger)*1.2,c,'cube')
+        if len(owned)<2:
+            for p in obs.get('pickups',[]):
+                d=d2(here,p['pos'])
+                if p['kind'] in owned or p['kind']=='gun' or d>175: continue
+                danger=min((d2(p['pos'],e['pos']) for e in enemies),default=999)
+                add({'laser':177,'lightning':185,'mortar':158}.get(p['kind'],0)-d*.83-max(0,35-danger)*1.2,p,'weapon',p['kind'])
+        if not zone_urgent and near>65 and hp>.33:
+            for p in obs.get('drops',[]):
+                d=d2(here,p['pos']); danger=min((d2(p['pos'],e['pos']) for e in enemies),default=999)
+                if d<200 and danger>42 and p['lands_in']<d/10+9:
+                    add(205-d*.78+(45 if hp<.65 else 0)-max(0,80-danger),p,'drop')
+            if t<245 and (me['cubes']<13 or near>160):
+                for n in obs['mechs']:
+                    if n['kind']!='npc': continue
+                    d=d2(here,n['pos'])
+                    if d>140 or abs(n['pos'][2]-here[2])>6:continue
+                    danger=min((d2(n['pos'],e['pos']) for e in enemies),default=999)
+                    if danger<37:continue
+                    add(147-.84*d+(25 if n['hp']<160 else 0)+(12 if self.visible_to_shoot(me,n) else -25),n,'npc')
+                for c in obs.get('crates',[]):
+                    d=d2(here,c['pos'])
+                    if d>130:continue
+                    thing=dict(c,kind='crate',vel=[0,0,0])
+                    danger=min((d2(c['pos'],e['pos']) for e in enemies),default=999)
+                    if danger<35:continue
+                    add(129-.82*d+(22 if len(owned)==1 else 0)+(20 if c['hp']<140 else 0)+(10 if self.visible_to_shoot(me,thing) else -30),c,'crate')
+        if not opts:
+            self.farm_focus=None; self.new_objective=None; return None
+        opts.sort(key=lambda c:c[0],reverse=True)
+        old=next((c for c in opts if c[1]==self.farm_focus),None)
+        best=old if old and old[0]>opts[0][0]-16 else opts[0]
+        if best[0]<35:
+            self.farm_focus=None; self.new_objective=None;return None
+        self.farm_focus=best[1];self.new_objective=best
+        return best
 
     def choose_target(self, obs, me, enemies, objective, near):
-        # v3's farming policy stays in place. Prioritize enemies only when
-        # nearby, attackable or weak; don't chase the distant house squad.
-        here = me['pos']
-        t = obs['t']
-        candidates=[]
+        # A one-shot finish beats spreading damage over healthy opponents.
+        if objective and objective[3] in ('npc','crate') and near>93:
+            pool=obs['mechs'] if objective[3]=='npc' else obs['crates']
+            o=next((p for p in pool if p['id']==objective[1]),None)
+            if o:
+                if objective[3]=='crate':o=dict(o,kind='crate',vel=[0,0,0])
+                if self.visible_to_shoot(me,o) and d2(me['pos'],o['pos'])<150:
+                    return o
+        opts=[]
         for e in enemies:
-            dist = d2(here, e['pos'])
-            if dist > 253 or not self.visible_to_shoot(me, e):
-                continue
-            max_hp = max(1, e.get('max_hp', 1400))
-            relative = e.get('hp', max_hp) / max_hp
-            toward_us = math.atan2(here[1] - e['pos'][1], here[0] - e['pos'][0])
-            facing = abs(angle_delta(toward_us, e.get('aim', [0, 0])[0])) < .34
-            score = (2.20 - .008 * dist + 1.72 * (1 - relative)
-                     + (.69 if dist < 80 else 0)
-                     + (.42 if e['id'] == self.enemy_id else 0)
-                     + (.63 if e['id'] == self.attacker_id and t < self.attacker_until else 0)
-                     + (.26 if facing and dist < 155 else 0)
-                     + (.38 if e.get('charging') and dist < 175 else 0))
-            candidates.append((score, e, dist))
-        if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            _, enemy, dist = candidates[0]
-            if (dist < 170 or (enemy.get('hp', 1400) < 700 and dist < 215)
-                    or (near < 215 and objective is None)):
-                self.enemy_id=enemy['id']
-                self.enemy_locked_at=t
-                return enemy
-        # Prefer finishing farm objectives when safe rather than switching to a
-        # mech 200m away and resetting health regeneration every few seconds.
-        if objective and objective[3] in ('npc', 'crate') and near > 142:
-            pool=obs['mechs'] if objective[3] == 'npc' else obs['crates']
-            for item in pool:
-                if item['id'] != objective[1]:
-                    continue
-                if objective[3]=='crate':
-                    item={'id':item['id'], 'kind':'crate', 'pos':item['pos'],
-                          'vel':[0,0,0], 'hp':item['hp']}
-                if self.visible_to_shoot(me,item):
-                    return item
-        if candidates:
-            self.enemy_id=candidates[0][1]['id']
-            self.enemy_locked_at=t
-            return candidates[0][1]
-        # Preserve v3's opportunistic crate / drone fire in peacetime.
-        return super().choose_target(obs, me, [], objective, near)
+            d=d2(me['pos'],e['pos'])
+            if d>270 or not self.visible_to_shoot(me,e):continue
+            hp=e.get('hp',1400); maxhp=e.get('max_hp',1400)
+            bearing=math.atan2(e['pos'][1]-me['pos'][1],e['pos'][0]-me['pos'][0])
+            score=3.4-0.011*d+2.4*(1-hp/max(1,maxhp))
+            score+=.9 if hp<250 else 0
+            score+=.6 if e['id']==self.previous_target else 0
+            score-=.23*abs(angle_delta(bearing,me['aim'][0]))
+            if self.current_obs and any(a.get('by')==e['id'] and a.get('type')=='damaged' for a in obs.get('events',[])):score+=.65
+            opts.append((score,e))
+        if opts:
+            return max(opts,key=lambda x:x[0])[1]
+        return super().choose_target(obs,me,enemies,objective,near)
+
+    def aim(self, me, thing, kind):
+        if kind != 'gun':
+            result=super().aim(me,thing,kind)
+            return result
+        w=next((w for w in me['weapons'] if w and w['kind']=='gun'),None)
+        speed=w['stats'].get('speed',252) if w else 252
+        x,y,z=me['pos']; muzzle=z+me['stats'].get('muzzle_height',7)
+        p=thing['pos'];v=thing.get('vel',[0,0,0]);k=thing['kind']
+        if k=='mech': h=4.5*(1+.05*thing.get('cubes',0))
+        else:h=1.75 if k=='npc' else 1.2
+        # Solve a fixed point for muzzle-offset projectile intercept, plus
+        # a small action-to-simulation lead. Do not extrapolate far into the air.
+        tt=d2(me['pos'],p)/max(1,speed)
+        for _ in range(4):
+            dt=tt+.05
+            px=p[0]+v[0]*dt;py=p[1]+v[1]*dt
+            pz=p[2]+h+max(-12,min(12,v[2]))*min(dt,.35)
+            tt=max(0,(math.sqrt((px-x)**2+(py-y)**2+(pz-muzzle)**2)-3)/speed)
+        return math.atan2(py-y,px-x),clamp(math.atan2(pz-muzzle,max(.01,math.hypot(px-x,py-y))),-.7,1.3),tt
+
+    def combat_move(self, me, enemies, target, moving, urgent, t):
+        if urgent or not enemies:return moving
+        near=d2(me['pos'],enemies[0]['pos'])
+        if near>165:return moving
+        obj=self.new_objective
+        if obj and obj[3] in ('cube','weapon') and d2(me['pos'],obj[2])<18 and near>26:
+            return moving
+        e=target if target and target['kind']=='mech' else enemies[0]
+        dd=d2(me['pos'],e['pos']); hp=me['hp']/max(1,me['max_hp'])
+        n=sum(d2(me['pos'],p['pos'])<100 for p in enemies)
+        w=me['weapons'][1];kind=w['kind'] if w else 'gun'
+        # Lightning's reliable close-range DPS changes our optimal distance.
+        desired=31 if kind=='lightning' and n<=1 and hp>.52 and me['energy']>20 else 73 if kind=='gun' else 97
+        if hp<.35 or n>=2:desired=max(desired,112)
+        if e.get('hp',1400)<180 and hp>.40 and n<=1:desired=min(desired,50)
+        nx,ny=norm(e['pos'][0]-me['pos'][0],e['pos'][1]-me['pos'][1])
+        radial=clamp((dd-desired)/35,-1.45,.94)
+        side=self.engage_side if int(t/2.4)%2==0 else -self.engage_side
+        sx,sy=norm(nx*radial-ny*side,ny*radial+nx*side)
+        if near<42 and n>=2:
+            fx,fy=0.,0.
+            for p in enemies:
+                d=d2(me['pos'],p['pos'])
+                if d<115:
+                    ax,ay=norm(me['pos'][0]-p['pos'][0],me['pos'][1]-p['pos'][1]);f=(115-d)/max(10,d)
+                    fx+=ax*f;fy+=ay*f
+            sx,sy=norm(sx+fx*.65,sy+fy*.65)
+        blend=clamp((180-near)/100,.20,.95)
+        return norm(moving[0]*(1-blend)+sx*blend,moving[1]*(1-blend)+sy*blend)
 
     def fight(self, obs, me, target, act, enemies, near, urgent):
-        super().fight(obs, me, target, act, enemies, near, urgent)
-        t=obs['t']
-        if target is None and not enemies:
-            if self.alert_yaw is not None and t < self.alert_until:
-                act['aim']=[round(self.alert_yaw,5),0.]
-            else:
-                # Sweep the vision wedge in ~2.5 seconds, not ~7s (v3).
-                # 2.5 rad/s is below the default 4 rad/s torso turn cap.
-                act['aim']=[round(angle_delta(2.5*t + .7*self.orbit_dir, 0.),5), 0.]
-        if target and me['weapons'][1] and me['weapons'][1]['kind']=='laser':
-            w=me['weapons'][1]
-            close_count=sum(d2(me['pos'],e['pos'])<80 for e in enemies)
-            hp=me['hp']/max(1,me['max_hp'])
-            if close_count>=3 and hp<.65:
-                # Charging slows the mech to half speed; abort unwinnable charge.
-                act['fire'][1]=False
-            if act['fire'][0] and act['fire'][1] and target is not None:
-                # Do not waste gun ammo if the laser aim and gun intercept differ.
-                gun=self.aim(me,target,'gun')
-                if gun and (abs(angle_delta(gun[0],act.get('aim',[0,0])[0])) > .072 or
-                            abs(gun[1]-act.get('aim',[0,0])[1]) > .09):
-                    act['fire'][0]=False
-
-    def _walkable_direction(self, me, move, obs):
-        if not self.nav.ok or not (move[0] or move[1]):
-            return move
-        x,y,z=me['pos']
-        here=(x,y)
-        # Only use the conservative ground-plane grid near the ground; on a roof
-        # it could be wrong and wrongly steer us off the roof.
-        if z > self.nav.ground(x,y) + 5:
-            return move
-        dx,dy=norm(move[0],move[1])
-        # Avoid heading straight into buildings after the combat strafe has
-        # overridden the A* route. Consider short-horizon alternative headings.
-        horizon=17.0 if me['grounded'] else 9.0
-        if self.nav.clear(here, (x + dx*horizon, y + dy*horizon)):
-            return dx,dy
-        theta=math.atan2(dy,dx)
-        best=None
-        best_score=-1000.0
-        offsets=(.45,-.45,.82,-.82,1.25,-1.25,1.70,-1.70,2.24,-2.24,3.14)
-        for angle in offsets:
-            ux,uy=math.cos(theta+angle),math.sin(theta+angle)
-            nx,ny=x+ux*horizon, y+uy*horizon
-            if not self.nav.clear(here,(nx,ny)):
-                continue
-            # Reward closeness to requested heading, safe zone, and distance
-            # from clusters of the visible practice bots.
-            nc=obs['zone']['next_center'];nr=obs['zone']['next_radius']
-            future_dist=d2((nx,ny),nc)
-            zone_penalty=max(0,future_dist - max(8,nr-13))*.12 if nr<160 else 0
-            nearest=min((d2((nx,ny),e['pos']) for e in obs['mechs']
-                         if e['kind']=='mech'),default=999)
-            danger=max(0,50-nearest)*.035
-            val=2.5*math.cos(angle) - zone_penalty - danger
-            if val>best_score:
-                best=(ux,uy)
-                best_score=val
-        return best if best is not None else (dx,dy)
+        super().fight(obs,me,target,act,enemies,near,urgent)
+        if not target:
+            if self.last_hit_direction is not None and obs['t']-self.last_hit_time<1.1:
+                act['aim']=[self.last_hit_direction,0.]
+            return
+        self.previous_target=target['id']
+        gun=me['weapons'][0]; secondary=me['weapons'][1]
+        d=d2(me['pos'],target['pos'])
+        if gun and gun['kind']=='gun' and gun.get('reload',0)<=0 and gun.get('ammo',0)>0:
+            shot=self.aim(me,target,'gun'); cmd=act.get('aim',me['aim'])
+            ry=me['stats'].get('turn_rate',4.)*.05
+            rp=me['stats'].get('pitch_rate',3.)*.05
+            y=me['aim'][0]+clamp(angle_delta(cmd[0],me['aim'][0]),-ry,ry)
+            p=me['aim'][1]+clamp(cmd[1]-me['aim'][1],-rp,rp)
+            k=target['kind']; radius=2.5*(1+.05*target.get('cubes',0)) if k=='mech' else 1.8 if k=='npc' else 1.4
+            tol=clamp(math.atan2(radius,max(2,d))+.011,.014,.17)
+            compatible=abs(angle_delta(cmd[0],shot[0]))<tol and abs(cmd[1]-shot[1])<max(.025,tol*1.5)
+            aligned=abs(angle_delta(y,shot[0]))<tol and abs(p-shot[1])<max(.025,tol*1.5)
+            act['fire'][0]=bool(d<gun['stats'].get('range',230)-3 and compatible and aligned)
+            # Do not start an unnecessary reload while a target is in range.
+            if act['fire'][0]:act['reload']=False
+        if secondary and secondary['kind']=='lightning' and d<secondary['stats'].get('range',45)-2:
+            bearing=math.atan2(target['pos'][1]-me['pos'][1],target['pos'][0]-me['pos'][0])
+            cone=math.radians(secondary['stats'].get('cone_deg',30))*.5
+            act['fire'][1]=bool(abs(angle_delta(bearing,me['aim'][0]))<cone*.92 and me['energy']>=secondary['stats'].get('energy',3)+2 and self.visible_to_shoot(me,target))
 
     def act(self, obs):
-        t=obs['t'];me=obs['self']
-        # Track unexpected attackers before making firing and movement decisions.
-        for event in obs.get('events', []):
-            kind=event.get('type')
-            if kind=='damaged':
-                b=event.get('bearing')
-                if isinstance(b,(int,float)) and math.isfinite(b):
-                    self.alert_yaw=b
-                    self.alert_until=t+1.7
-                attacker=event.get('by')
-                if isinstance(attacker,int) and attacker < 16:
-                    self.attacker_id=attacker
-                    self.attacker_until=t+4
-            elif kind=='hit':
-                self.last_dealt=t
-        if not any(m['kind']=='mech' for m in obs['mechs']) and t>=self.alert_until:
-            danger={'laser_charge':5,'laser':4,'mortar':4,'lightning':4,'gun':3}
-            recent=[(danger.get(s.get('kind'),0)-s.get('age',0),s.get('bearing'))
-                    for s in obs.get('sounds',[])
-                    if s.get('dist')=='near' and s.get('kind') in danger
-                    and isinstance(s.get('bearing'),(int,float))]
-            if recent:
-                self.alert_yaw=max(recent)[1]
-                self.alert_until=t+.55
+        self.current_obs=obs
+        me=obs['self']; t=obs['t']; self.new_objective=None
+        for a in obs.get('events',[]):
+            if a.get('type')=='damaged' and a.get('bearing') is not None:
+                self.last_hit_direction=a['bearing']; self.last_hit_time=t
         act=super().act(obs)
-        moving=tuple(act.get('move',(0,0)))
-        moving=self._walkable_direction(me,moving,obs)
-        act['move']=[round(moving[0],5),round(moving[1],5)]
-        # Efficient sprinting toward desirable early resources, then reserve
-        # energy for close-range dodging and zone emergencies.
-        objective=self.objective
-        closest=min((d2(me['pos'],e['pos']) for e in obs['mechs']
-                     if e['kind']=='mech'),default=999)
-        if objective and objective[3] in ('cube','weapon','npc','crate'):
-            dd=d2(me['pos'],objective[2])
-            if (dd>65 and t<160 and closest>150 and me['energy']>82
-                    and me['grounded'] and not act.get('boost')
-                    and me['hp'] > me['max_hp']*.45):
-                act['boost']=True
-        if objective and objective[3]=='drop':
-            dd=d2(me['pos'],objective[2])
-            if dd<6.0 and objective[2] is not None and closest>42:
-                act['move']=[0.,0.]
-                act['boost']=False
-        # Only skip harassment shots when actually safe and extremely hurt.
-        # v4's broad cover/pacifism mode suppressed too much offense.
-        hp=me['hp']/max(1,me['max_hp'])
-        if (hp<.37 and closest>180 and not obs['zone']['dps']>80
-                and t-self.last_damage<7 and t-self.last_dealt>2.8):
-            act['fire']=[False,False]
-            if me['weapons'][0] and me['weapons'][0]['kind']=='gun':
-                if me['weapons'][0].get('ammo',12)<me['weapons'][0]['stats'].get('mag',12):
-                    act['reload']=True
+        # Avoid running into a wall after combining strafe, retreat, and dodge.
+        # Only intervene if the start is a free navigation cell (not a rooftop).
+        x,y,z=me['pos']; mx,my=act.get('move',[0.,0.]); speed=math.hypot(mx,my)
+        if self.nav.ok and speed>.1 and me.get('grounded'):
+            i,j=self.nav.ij(x,y)
+            if not self.nav.grid[j*self.nav.nx+i] and not self.nav.clear((x,y),(x+mx*11,y+my*11)):
+                yaw=math.atan2(my,mx)
+                for offset in (.52,-.52,1.04,-1.04,1.57,-1.57):
+                    a=yaw+offset;nx,ny=math.cos(a),math.sin(a)
+                    if self.nav.clear((x,y),(x+nx*11,y+ny*11)):
+                        act['move']=[nx*speed,ny*speed];break
+        # Use boost to win the loot race and break an enemy's aim, with reserve.
+        if me['grounded'] and me['energy']>58 and speed>.6 and self.new_objective and self.new_objective[3] in ('weapon','cube','drop'):
+            d=d2(me['pos'],self.new_objective[2])
+            if 15<d<100:act['boost']=True
         return act
 
 
-Bot = AegisV5
+Bot = V6Bot
+
+
 mf.run(Bot)
