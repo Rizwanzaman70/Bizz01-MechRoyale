@@ -1315,382 +1315,170 @@ class V10Bot(V9Bot):
             a['move']=[0.,0.];a['boost']=False;a['jump']=False
         return a
 
-
-# V11: sound-aware defense and a bounded, real-geometry escape planner.
-# All opponent locations come from the observation. Never reveal hidden spawns.
-class V11Bot(V10Bot):
-    name = 'Bizz01-Aegis-v11'
-
-    def __init__(self, hello):
-        super().__init__(hello)
-        self.cover_goal = None
-        self.cover_until = -1.
-        self.cover_recheck = -1.
-        self.cover_gain = 0.
-        self.sound_bearing = None
-        self.sound_time = -100.
-        self.last_attacker = None
-        self.last_attacked_at = -100.
-        self.attack_bearing = None
-
-    def choose_target(self, obs, me, enemies, objective, near):
-        # Preserve V10's successful mech target focus. Only interrupt farming
-        # a crate/NPC when a known shooter is actively damaging us.
-        picked=super().choose_target(obs,me,enemies,objective,near)
-        if picked is not None and picked['kind']=='mech':
-            return picked
-        if obs['t']-self.last_attacked_at<1.1 and self.last_attacker is not None:
-            shooter=next((e for e in enemies if e['id']==self.last_attacker),None)
-            if shooter is not None and d2(me['pos'],shooter['pos'])<205 and self.visible_to_shoot(me,shooter):
-                return shooter
-        return picked
-
-    def threat_value(self, xy, z, enemies):
-        # Only the closest three opponents matter for this local escape step.
-        value=0.
-        for enemy in enemies[:3]:
-            distance=d2(xy,enemy['pos'])
-            if distance>300:continue
-            weapons=enemy.get('weapons',[])
-            reach=max((280 if k=='laser' else 230 if k=='gun' else 230 if k=='mortar' else 45 for k in weapons),default=230)
-            if distance>reach+25: continue
-            # Opponents can shoot above our feet; check whether solid geometry
-            # interrupts the connection at mech center height.
-            a=(enemy['pos'][0],enemy['pos'][1],enemy['pos'][2]+7)
-            b=(xy[0],xy[1],z+4.5)
-            if not self.sight.clear(a,b):continue
-            danger=1.0 + .5*max(0.,(130-distance)/130.)
-            if 'lightning' in weapons and distance<51:danger+=1.0
-            if 'laser' in weapons and distance<275:danger+=.25
-            value+=danger
-        return value
-
-    def choose_cover(self, obs, me, enemies):
-        t=obs['t'];pos=me['pos'];zone=obs['zone'];here=pos[:2]
-        if not self.nav.ok or not self.sight.prisms or not enemies:return None
-        # Do not abandon a nearly-completed supply capture or a mandatory
-        # safe-zone relocation for optional cover.
-        if self.capture_lock is not None:return None
-        dest,urgent,_=self.zone_target(me,zone,t)
-        if urgent or not me['grounded']:
-            self.cover_goal=None
-            return None
-        # Finish the currently safe escape corridor rather than flip-flopping
-        # between similarly scored cover points on each observation.
-        if self.cover_goal is not None and t<self.cover_until:
-            if d2(here,self.cover_goal)>7 and self.nav.clear(here,self.cover_goal) and d2(self.cover_goal,zone['next_center'])<zone['next_radius']-7:
-                return self.cover_goal
-        if t<self.cover_recheck:return self.cover_goal
-        self.cover_recheck=t+1.1
-        self.cover_goal=None;self.cover_gain=0.
-        closest=d2(here,enemies[0]['pos'])
-        hp=me['hp']/max(1.,me['max_hp'])
-        pressure=sum(d2(here,e['pos'])<150 for e in enemies)
-        recently_hit=t-self.last_attacked_at<3.5
-        if not ((hp<.58 and pressure>=2) or (hp<.31 and closest<185) or
-                (hp<.42 and recently_hit and pressure>=1)):return None
-        # Avoid giving up a valuable nearby pickup to seek speculative cover.
-        o=self.new_objective
-        if o and o[3] in ('cube','weapon','drop') and d2(here,o[2])<12:return None
-        direct=self.threat_value(here,pos[2],enemies)
-        if direct<.8:return None
-        nc=zone['next_center'];nr=zone['next_radius']
-        # Precompute feasible short exits. This is a local planner, not A*.
-        # A direct lane is required, and no candidate may exit the next zone.
-        candidates=[]
-        facing=math.atan2(here[1]-enemies[0]['pos'][1],here[0]-enemies[0]['pos'][0])
-        ground=self.nav.ground
-        for radius in (28.,52.):
-            for k in range(16):
-                a=facing+(k-8)*TAU/16
-                point=(here[0]+math.cos(a)*radius,here[1]+math.sin(a)*radius)
-                if d2(point,nc)>max(7.,nr-min(18.,nr*.15)):continue
-                if not self.nav.clear(here,point):continue
-                gx,gy=self.nav.ij(*point)
-                if self.nav.grid[gy*self.nav.nx+gx]:continue
-                z=ground(*point)
-                if abs(z-pos[2])>6.:continue
-                distance_gain=(min(d2(point,e['pos']) for e in enemies[:3])-closest)/80.
-                zonedelta=(d2(here,nc)-d2(point,nc))/200.
-                candidates.append((point,z,distance_gain,zonedelta))
-        # Bounding the expensive visibility calls prevents tick-time spikes.
-        # Prefer routes farther from attackers, but evaluate side paths too.
-        candidates.sort(key=lambda q:q[2]+.3*q[3],reverse=True)
-        best_gain=0.;best_point=None
-        for point,z,dist_gain,zone_gain in candidates[:20]:
-            exposure=self.threat_value(point,z,enemies)
-            gain=(direct-exposure)*2.8 + .38*dist_gain + .2*zone_gain
-            if gain>best_gain:
-                best_gain=gain;best_point=point
-        if best_point is not None and best_gain>.85:
-            self.cover_goal=best_point;self.cover_gain=best_gain
-            self.cover_until=t+3.0
-        return self.cover_goal
-
-    def act(self, obs):
-        t=obs['t'];me=obs['self']
-        for event in obs.get('events',[]):
-            if event.get('type')=='damaged' and event.get('weapon')!='zone':
-                if event.get('bearing') is not None:
-                    self.attack_bearing=event['bearing']
-                self.last_attacked_at=t
-                self.last_attacker=event.get('by')
-        for sound in obs.get('sounds',[]):
-            if sound.get('kind') in ('gun','mortar','laser','laser_charge','lightning','explosion','npc_gun'):
-                if sound.get('dist') in ('near','mid') and isinstance(sound.get('bearing'),(float,int)):
-                    # Prioritize nearer sounds and recent events, but don't
-                    # chase them: only direct torso facing when no target.
-                    age=max(0.,float(sound.get('age',0.)))
-                    if t-age>self.sound_time or sound.get('dist')=='near':
-                        self.sound_bearing=float(sound['bearing']);self.sound_time=t-age
-        action=super().act(obs)
-        enemies=sorted((e for e in obs.get('mechs',[]) if e['kind']=='mech'),
-                       key=lambda e:d2(me['pos'],e['pos']))
-        target=self.aim_target
-        # If our bot has no visible firing target, orient the armor toward a
-        # recent attacker instead of rotating with the default search sweep.
-        if not enemies and t-self.last_attacked_at<2.0 and self.attack_bearing is not None:
-            action['aim']=[self.attack_bearing,0.]
-        elif not enemies and t-self.sound_time<1.1 and self.sound_bearing is not None:
-            action['aim']=[self.sound_bearing,0.]
-        elif enemies and self.current_obs and not action['fire'][0] and not action['fire'][1]:
-            # When someone is close but behind opaque cover, keep rear armor
-            # toward the nearest tracked attacker while searching for a lane.
-            if d2(me['pos'],enemies[0]['pos'])<90 and not self.visible_to_shoot(me,enemies[0]):
-                action['aim']=[math.atan2(enemies[0]['pos'][1]-me['pos'][1],
-                                          enemies[0]['pos'][0]-me['pos'][0]),0.]
-        if not enemies:
-            self.cover_goal=None;self.cover_gain=0.;return action
-        self.choose_cover(obs,me,enemies)
-        goal=self.cover_goal
-        if goal is not None and t<self.cover_until:
-            here=me['pos'];d=d2(here,goal)
-            if d<7 or not self.nav.clear(here,goal):
-                self.cover_goal=None
-            else:
-                dx,dy=norm(goal[0]-here[0],goal[1]-here[1])
-                # Keep a small portion of prior dodge/motion to avoid abrupt
-                # reversals while transitioning into the escape corridor.
-                old=action.get('move',[0.,0.])
-                dx,dy=norm(.84*dx+.16*old[0],.84*dy+.16*old[1])
-                (dx,dy),projectile_risk=self.dodge(obs,me,(dx,dy))
-                action['move']=[round(dx,5),round(dy,5)]
-                action['jump']=False
-                if me['energy']>57 and d>20 and me['grounded']:
-                    action['boost']=True
-                # If we're charging a laser, don't cancel the shot; the weapon
-                # fires according to the original, proven controller.
-        return action
-
-
-
-# V12: target elimination, efficient upgrades, and defensive regeneration.
-# Dynamic state is limited to observed data and the public arena geometry.
-class V12Bot(V11Bot):
-    name = 'Bizz01-Aegis-v12'
+# V13: retain V9's official-score-leading combat policy, plus V10's
+# objective correctness fixes. Reinforce legal armor/weapon/energy choices.
+# No hidden state, team helpers, network, or undocumented abilities.
+class V13Bot(V10Bot):
+    name='Bizz01-Aegis-v13'
 
     def __init__(self, hello):
         super().__init__(hello)
-        self.last_combat_event = -200.
-        self.recovery_mode = False
-        self.locked_enemy = None
-        self.locked_until = -100.
-        self.regen_since = -100.
-        self.last_upgrades = None
-
-    def aim(self, me, thing, kind):
-        low = super().aim(me, thing, kind)
-        if kind!='mortar':
-            return low
-        if low is not None and self.mortar_clear(me, low):
-            return low
-        # For the mortar, the ballistic equation has two solutions. The old
-        # controller always selected the low arc and silently gave up whenever
-        # a building intercepted it. Try a valid high arc over the obstruction.
-        weapon=me['weapons'][1]
-        if not weapon or weapon['kind']!='mortar':return low
-        st=weapon['stats'];speed=st.get('speed',72.);g=st.get('gravity',22.)
-        x,y,z=self.muzzle(me,'mortar')
-        p=thing['pos'];v=thing.get('vel',[0,0,0]);h,_=self.height_radius(thing)
-        tt=3.0
-        for _ in range(5):
-            dt=tt+.05
-            dx=p[0]+v[0]*dt-x;dy=p[1]+v[1]*dt-y
-            horiz=math.hypot(dx,dy)
-            dz=p[2]+h*.48+clamp(v[2]*dt,-4,4)-z
-            disc=speed**4-g*(g*horiz*horiz+2*dz*speed*speed)
-            if disc<=0 or horiz<20:return low
-            theta=math.atan2(speed**2+math.sqrt(disc),g*horiz)
-            if theta>me['stats'].get('max_pitch',1.3) or theta<-.7:
-                return low
-            tt=max(.05,(horiz/max(.01,math.cos(theta))-3)/speed)
-            if tt>st.get('ttl',7):return low
-        high=(math.atan2(dy,dx),theta,tt)
-        return high if self.mortar_clear(me,high) else low
+        self.last_bearing=None
+        self.last_bearing_at=-100.
+        self.last_armor_rear=False
 
     def upgrade(self, obs, me):
-        # Rank upgrades by practical effect while fighting a coordinated team.
-        # 12-round gun + 2.4s reload has ~101 DPS; a 20-round drum magazine
-        # with shorter reload yields ~137 DPS (not merely +8/12 capacity).
-        choices = obs.get('offer', {}).get('choices', [])
-        if not choices:
-            return 0
-        weapon = me['weapons'][1]
-        second = weapon['kind'] if weapon else None
-        hp = me['hp']/max(1., me['max_hp'])
-        t = obs['t']
-        energy = me.get('energy', 100.)
-        scores = {
-            'gun_mag': 149, 'gun_damage': 143, 'gun_rate': 132,
-            'armor': 140, 'plating': 132,
-            'servos': 139 if t < 230 else 128,
-            'nanites': 138 if hp < .72 else 125,
-            'gyros': 101, 'gun_velocity': 103,
-            'reactor': 92, 'capacitor': 81, 'jets': 103,
-            'laser_charge': 154 if second=='laser' else 0,
-            'laser_damage': 148 if second=='laser' else 0,
-            'laser_pierce': 96,
-            'lightning_range': 157 if second=='lightning' else 0,
-            'lightning_efficiency': 148 if second=='lightning' else 0,
-            'lightning_chain': 93,
-            'mortar_reload': 142 if second=='mortar' else 0,
-            'mortar_velocity': 125 if second=='mortar' else 0,
-            'mortar_splash': 127 if second=='mortar' else 0,
-            'sensors': 87,
+        choices=(obs.get('offer') or {}).get('choices',[])
+        if not choices:return 0
+        hp=me['hp']/max(1.,me['max_hp'])
+        kinds={w['kind'] for w in me['weapons'] if w}
+        energy=me.get('energy',100.)
+        time=obs['t']
+        nearby=sum(1 for e in obs.get('mechs',[])
+                   if e.get('kind')=='mech' and d2(me['pos'],e['pos'])<125)
+        # Armor and plating remain valuable in squad-focused matches.
+        # Armor stacks add 8 percentage points each (up to 24% reduction).
+        # Plating stacks multiply max HP by 1.15 (up to 1.15^3 = 1.5209).
+        scores={
+            'armor':155,
+            'plating':157,
+            'gun_damage':152 if 'gun' in kinds else 0,
+            'gun_mag':152 if 'gun' in kinds else 0,
+            'gun_rate':143 if 'gun' in kinds else 0,
+            'gun_velocity':113 if 'gun' in kinds else 0,
+            'servos':133 if time<175 else 125,
+            'nanites':126 if hp<.85 else 114,
+            'gyros':104,
+            'sensors':91,
+            'jets':115,
+            'capacitor':116,
+            'reactor':113,
+            'laser_damage':160 if 'laser' in kinds else 0,
+            'laser_charge':154 if 'laser' in kinds else 0,
+            'laser_pierce':101 if 'laser' in kinds else 0,
+            'lightning_range':163 if 'lightning' in kinds else 0,
+            'lightning_efficiency':153 if 'lightning' in kinds else 0,
+            'lightning_chain':109 if 'lightning' in kinds else 0,
+            'mortar_reload':148 if 'mortar' in kinds else 0,
+            'mortar_velocity':132 if 'mortar' in kinds else 0,
+            'mortar_splash':125 if 'mortar' in kinds else 0,
         }
-        if hp < .32:
-            scores['plating'] += 9
-            scores['armor'] += 11
-            scores['nanites'] -= 4  # Regeneration cannot save an active duel.
-        if self.recovery_mode:
-            scores['nanites'] += 11
-        if energy < 22 and second=='lightning':
-            scores['lightning_efficiency'] += 5
-            scores['reactor'] += 8
-        return max(range(len(choices)), key=lambda idx: scores.get(choices[idx]['id'], 55))
+        if hp<.6:
+            scores['armor']+=6
+            scores['plating']-=4
+        if hp<.35:
+            scores['armor']+=5
+            scores['nanites']-=8
+        if nearby>=2:
+            scores['armor']+=7
+            scores['plating']+=3
+        if 'lightning' in kinds:
+            # While firing, regeneration is delayed; reduced energy cost is
+            # materially stronger than relying on reactor regen mid-duel.
+            scores['capacitor']=134
+            scores['reactor']=120
+            if energy<45:
+                scores['lightning_efficiency']+=9
+                scores['capacitor']+=8
+        if time<95 and 'gun' in kinds and hp>.65:
+            scores['gun_mag']+=2
+        return max(range(len(choices)),key=lambda i:scores.get(choices[i]['id'],75))
+
+    @staticmethod
+    def has_special_upgrade(me,kind):
+        return any(
+            str(u.get('id','') if isinstance(u,dict) else u).startswith(kind+'_')
+            for u in me.get('upgrades',[])
+        )
 
     def choose_objective(self, obs, me, enemies, near, zone_urgent):
-        # Upgrades/damage stop scaling after 10 cubes, while collision size
-        # continues increasing. Don't risk an exposed detour for more cubes.
-        # Prioritize killing other mechs after initial equipment/farm phase.
-        late_duel = obs['t'] > 95 and any(
-            d2(me['pos'],e['pos']) < 205 for e in enemies)
-        heal = self.recovery_mode and me['hp'] < me['max_hp']*.88
-        if late_duel or heal or me.get('cubes',0)>=10:
-            changed = dict(obs)
-            if late_duel or heal:
-                changed['mechs']=[e for e in obs['mechs'] if e['kind']=='mech']
-                changed['crates']=[]
-            if me.get('cubes',0)>=10:
-                changed['cubes']=[c for c in obs.get('cubes',[])
-                                  if d2(me['pos'],c['pos'])<9 and
-                                  (me['cubes'] in (14,20,27) or
-                                   me['hp']<me['max_hp']*.25)]
-            return super().choose_objective(changed,me,enemies,near,zone_urgent)
-        return super().choose_objective(obs,me,enemies,near,zone_urgent)
-
-    def choose_target(self, obs, me, enemies, objective, near):
-        here=me['pos']; t=obs['t']
-        enemy_list=[]
-        for e in enemies:
-            d=d2(here,e['pos'])
-            if d>275 or not self.visible_to_shoot(me,e):continue
-            secondary=me['weapons'][1]
-            reach=max(me['weapons'][0]['stats'].get('range',230) if me['weapons'][0] else 0,
-                      secondary['stats'].get('range',0) if secondary else 0)
-            if d>reach-2:continue
-            health=e.get('hp',1400)/max(1,e.get('max_hp',1400))
-            # Do not distribute damage among healthy mechs when one is nearly dead.
-            score=3.0 + 2.6*(1-health) - .014*d
-            score+=1.0 if e.get('hp',1400)<250 else 0.
-            if e['id']==self.locked_enemy and t<self.locked_until:score+=1.05
-            if secondary and secondary['kind']=='lightning':
-                if d<secondary['stats'].get('range',45)-2:score+=.7
-            bearing=math.atan2(e['pos'][1]-here[1], e['pos'][0]-here[0])
-            score-=abs(angle_delta(bearing,me['aim'][0]))*.12
-            enemy_list.append((score,e))
-        # Mortar can lob over walls using legally tracked enemy positions.
-        # Earlier versions always required direct gun LOS and therefore never
-        # used the mortar's most important advantage. Validate the full arc.
-        w=me['weapons'][1]
-        if w and w['kind']=='mortar' and w.get('cooldown',0)<2.9:
-            for e in enemies[:5]:
-                dist=d2(here,e['pos'])
-                if dist<32 or dist>195 or self.visible_to_shoot(me,e):continue
-                arc=self.aim(me,e,'mortar')
-                if arc is None or not self.mortar_clear(me,arc):continue
-                health=e.get('hp',1400)/max(1,e.get('max_hp',1400))
-                score=2.2+2.3*(1-health)-.013*dist
-                if e['id']==self.locked_enemy and t<self.locked_until:score+=.7
-                enemy_list.append((score,e))
-        # Prefer an in-range mech once the opening farm is complete, even if
-        # an NPC/crate is physically nearer. Eliminations determine placement.
-        if enemy_list and (near<150 or t>95 or self.recovery_mode):
-            e=max(enemy_list,key=lambda row:row[0])[1]
-            if e['id']!=self.locked_enemy:
-                self.locked_enemy=e['id'];self.locked_until=t+1.35
-            return e
-        return super().choose_target(obs,me,enemies,objective,near)
-
-    def fight(self,obs,me,target,act,enemies,near,urgent):
-        super().fight(obs,me,target,act,enemies,near,urgent)
-        if target and target['kind']=='mech' and not self.visible_to_shoot(me,target):
-            # An indirect mortar is legal; firing the gun at its blocking wall
-            # merely wastes ammunition and delays the next useful reload.
-            act['fire'][0]=False
-            secondary=me['weapons'][1]
-            if secondary and secondary['kind']=='mortar':
-                arc=self.aim(me,target,'mortar')
-                if arc is not None and self.mortar_clear(me,arc):
-                    # Turn toward the arced firing solution during reload so
-                    # the next shell is ready to launch as soon as it cools.
-                    act['aim']=[round(arc[0],6),round(arc[1],6)]
-
-    def choose_cover(self, obs, me, enemies):
-        # Never sacrifice a nearly-finished kill for a speculative detour.
-        # Cover remains a last-resort option when outnumbered and wounded.
-        hp = me['hp']/max(1., me['max_hp'])
-        near=sum(d2(me['pos'],e['pos'])<150 for e in enemies)
-        # If a reachable enemy is one hit from death, secure the elimination
-        # before withdrawing, provided our own health is not critical.
-        if hp>.34 and any(e.get('hp',1400)<170 and d2(me['pos'],e['pos'])<95
-                            and self.visible_to_shoot(me,e) for e in enemies):
-            self.cover_goal=None
-            return None
-        return super().choose_cover(obs,me,enemies)
+        # The V10 memory/path code remains the primary objective planner.
+        # Do not path toward a pickup we deliberately won't equip.
+        secondary=me['weapons'][1]
+        if secondary and self.has_special_upgrade(me,secondary['kind']):
+            self.loot_memory['pickups'].clear()
+            source=dict(obs);source['pickups']=[]
+        else:source=obs
+        chosen=super().choose_objective(source,me,enemies,near,zone_urgent)
+        if self.capture_lock is not None or zone_urgent or not me['in_zone']:
+            return chosen
+        # Getting a second weapon early is a direct, measurable power spike.
+        # Only use visible, ground-accessible pickups here; V10 memory handles
+        # later cases and the inherited action confirms range before taking.
+        secondary=me['weapons'][1]
+        t=obs['t']
+        if secondary and self.has_special_upgrade(me,secondary['kind']):
+            return chosen
+        if secondary is not None and secondary['kind']!='mortar':
+            return chosen
+        if t>155 or near<58:
+            return chosen
+        here=me['pos'];zone=obs['zone'];best=None
+        for p in obs.get('pickups',[]):
+            kind=p.get('kind')
+            if secondary is None:
+                if kind not in ('laser','lightning','mortar'):continue
+            elif kind!='laser':
+                continue
+            dist=d2(here,p['pos'])
+            if dist>105 or abs(p['pos'][2]-here[2])>4.5:continue
+            if d2(p['pos'],zone['next_center'])>zone['next_radius']-9:continue
+            ed=min((d2(p['pos'],e['pos']) for e in enemies),default=999.)
+            if ed<54:continue
+            score=198-dist*.85 if secondary is None else 132-dist*.95
+            if kind=='laser':score+=10
+            if kind=='lightning' and me['energy']>70:score+=1
+            if self.nav.ok and not self.nav.clear(here,p['pos']):score-=27
+            if best is None or score>best[0]:
+                best=(score,p['id'],tuple(p['pos'][:2]),'weapon',kind)
+        if best and (chosen is None or best[0]>chosen[0]+12):
+            key=(best[1],best[3])
+            if key!=self.objective_key:
+                self.route_path=[];self.route_goal=None;self.objective_key=key
+            self.farm_focus=best[1]
+            self.new_objective=best
+            return best
+        return chosen
 
     def act(self, obs):
-        me=obs['self'];t=obs['t']
-        if any(e.get('type') in ('hit','damaged') for e in obs.get('events',[])):
-            self.last_combat_event=t
-        hp=me['hp']/max(1.,me['max_hp'])
-        near=min((d2(me['pos'],e['pos']) for e in obs.get('mechs',[]) if e['kind']=='mech'),default=999)
-        # Do not reset the 5s out-of-combat heal timer to shoot 300HP crates
-        # while below half health and sufficiently distant from pursuers.
-        if (hp<.56 and near>120 and me['in_zone'] and obs['t']>55):
-            self.recovery_mode=True
-        elif hp>.84 or near<65 or not me['in_zone']:
-            self.recovery_mode=False
+        t=obs['t']; me=obs['self']
+        for event in obs.get('events',[]):
+            if event.get('type')=='damaged' and event.get('weapon')!='zone':
+                bearing=event.get('bearing')
+                if isinstance(bearing,(float,int)):
+                    self.last_bearing=float(bearing)
+                    self.last_bearing_at=t
+                    self.last_armor_rear=bool(event.get('rear'))
         action=super().act(obs)
-        if self.recovery_mode:
-            target_id=self.aim_target
-            live_targets={e['id']:e for e in obs.get('mechs',[])}
-            live_targets.update({e['id']:dict(e,kind='crate') for e in obs.get('crates',[])})
-            target=live_targets.get(target_id)
-            if target is None or target.get('kind')!='mech':
-                action['fire']=[False,False]
-                if me['weapons'][0] and me['weapons'][0].get('ammo',12) < me['weapons'][0]['stats'].get('mag',12):
-                    action['reload']=True
-        # A supply capture already underway must not be abandoned.
-        if self.capture_lock is not None:
-            action['jump']=False
-            return action
-        # Lightning is only effective inside a short cone; do not spend our
-        # chase energy boosting in parallel with sustained lightning firing.
-        w=me['weapons'][1]
-        if w and w['kind']=='lightning' and action['fire'][1] and near<45:
-            if me['energy']<45:action['boost']=False
+        second=me['weapons'][1]
+        enemies=[e for e in obs['mechs'] if e['kind']=='mech']
+        near=min((d2(me['pos'],e['pos']) for e in enemies),default=1e6)
+        if (second and second['kind']=='lightning' and me['in_zone']
+            and 32<near<95 and me['energy']<58 and me['hp']>.52*me['max_hp']
+            and sum(d2(me['pos'],e['pos'])<80 for e in enemies)<2
+            and not self.zone_target(me,obs['zone'],t)[1]
+            and not any(e.get('charging') and d2(me['pos'],e['pos'])<155 for e in enemies)
+            and not any(d2(me['pos'],p.get('pos',(9999,9999,9999)))<60 for p in obs.get('projectiles',[]))):
+            # Save lightning ammunition rather than boosting away the battery;
+            # leave emergency escapes and out-of-zone boosts intact.
+            action['boost']=False
+        # If attacked from behind while no visible opponent can be shot,
+        # point the reinforced frontal armor toward the known attack bearing.
+        if (not enemies and self.last_bearing is not None and
+            t-self.last_bearing_at<1.0 and self.last_armor_rear):
+            action['aim']=[self.last_bearing,0.0]
+        # Never discard a mortar that already received rare weapon upgrades.
+        if second and self.has_special_upgrade(me,second['kind']) and action.get('drop')==1:
+            action.pop('take',None);action.pop('drop',None)
+        # Deliberate auto-swap: upgrade unmodified mortar to laser while safe.
+        # Swapping requires two fields (take + drop) and real pickup range.
+        if second and second['kind']=='mortar' and not second.get('charge',0):
+            if not self.has_special_upgrade(me,'mortar') and near>78:
+                for p in obs.get('pickups',[]):
+                    if p['kind']=='laser' and d2(me['pos'],p['pos'])<3.6 and abs(p['pos'][2]-me['pos'][2])<3.5:
+                        action['take']=p['id'];action['drop']=1
+                        break
         return action
 
-Bot = V12Bot
+Bot=V13Bot
 mf.run(Bot)
