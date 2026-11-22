@@ -1050,7 +1050,151 @@ class V6Bot(Bot):
         return act
 
 
-Bot = V6Bot
+# V7: build on the measured V6 baseline, not on the weaker defensive variants.
+class V7Bot(V6Bot):
+    name = 'Bizz01-Aegis-v7'
 
+    def __init__(self, hello):
+        super().__init__(hello)
+        self.heal_mode = False
+        self.damage_clock = -100.0
+        self.boost_until = -1.0
+        self.enemy_history = {}
+        self.recovery_goal = None
+
+    def utility(self, kind, me, near, alive):
+        # Lightning has excellent dependable DPS at close range, especially
+        # against attackers in a squad. Laser excels at range and vs mortar.
+        scores = {'gun':0, 'mortar':42, 'laser':80, 'lightning':94}
+        val = scores.get(kind,0)
+        if kind == 'laser' and near > 135: val += 10
+        if kind == 'lightning' and alive <= 7: val += 12
+        for u in me.get('upgrades', []):
+            name = u if isinstance(u,str) else u.get('id','') if isinstance(u,dict) else ''
+            if name.startswith(kind+'_'): val += 12
+        return val
+
+    def choose_objective(self, obs, me, enemies, near, zone_urgent):
+        best = super().choose_objective(obs, me, enemies, near, zone_urgent)
+        if zone_urgent: return best
+        w = me['weapons'][1]
+        here = me['pos']; zone=obs['zone']; alive=obs['alive']
+        # Replace weak mortar once a better weapon is reachable. Do not walk
+        # past a useful upgrade just because the second slot is occupied.
+        if w and near > 65 and w.get('charge',0)<=0:
+            for p in obs.get('pickups',[]):
+                kind=p['kind']; d=d2(here,p['pos'])
+                gain=self.utility(kind,me,near,alive)-self.utility(w['kind'],me,near,alive)
+                if kind in ('gun',w['kind']) or gain<24 or d>90 or abs(p['pos'][2]-here[2])>4:continue
+                if d2(p['pos'],zone['center'])>zone['radius']-5:continue
+                if min((d2(e['pos'],p['pos']) for e in enemies),default=999)<42:continue
+                if self.nav.ok and not self.nav.clear(here,p['pos']):continue
+                score=125+gain-d*1.15
+                if best is None or score>best[0]+7:best=(score,p['id'],tuple(p['pos'][:2]),'weapon',kind)
+        # Supply drops are a full heal; give them more weight when hurt,
+        # but never insist on a contested ring.
+        if me['hp'] < me['max_hp']*.80:
+            for p in obs.get('drops',[]):
+                d=d2(here,p['pos']); danger=min((d2(e['pos'],p['pos']) for e in enemies),default=999)
+                if d>175 or danger<62 or p.get('holder') not in (None,me['id']):continue
+                if p['lands_in']>d/10+6 or d2(p['pos'],zone['next_center'])>zone['next_radius']-8:continue
+                score=260-d*.8-max(0,100-danger)*1.5
+                if best is None or score>best[0]:best=(score,p['id'],tuple(p['pos'][:2]),'drop',None)
+        self.new_objective=best
+        if best:self.farm_focus=best[1]
+        return best
+
+    def aim(self, me, thing, kind):
+        shot=super().aim(me,thing,kind)
+        if kind!='laser' or shot is None:return shot
+        # Scale target height with cubes: use center mass for laser too.
+        x,y,z=me['pos']; p=thing['pos'];v=thing.get('vel',[0,0,0])
+        h=4.5*(1+.05*thing.get('cubes',0)) if thing['kind']=='mech' else 1.75 if thing['kind']=='npc' else 1.2
+        dx=p[0]+v[0]*.05-x;dy=p[1]+v[1]*.05-y
+        dz=p[2]+h+v[2]*.05-z-me['stats'].get('muzzle_height',7)
+        return math.atan2(dy,dx),clamp(math.atan2(dz,max(.01,math.hypot(dx,dy))),-.7,1.3),.05
+
+    def combat_move(self, me, enemies, target, moving, urgent, t):
+        baseline=super().combat_move(me,enemies,target,moving,urgent,t)
+        if urgent or not enemies:return baseline
+        near=d2(me['pos'],enemies[0]['pos']); hp=me['hp']/max(1,me['max_hp'])
+        w=me['weapons'][1]; obj=self.new_objective
+        if obj and obj[3] in ('cube','weapon','drop') and d2(me['pos'],obj[2])<25 and near>32:return moving
+        close=sum(d2(me['pos'],e['pos'])<95 for e in enemies)
+        e=target if target and target['kind']=='mech' else enemies[0]
+        d=d2(me['pos'],e['pos']); x,y=me['pos'][:2]
+        nx,ny=norm(e['pos'][0]-x,e['pos'][1]-y)
+        side=self.engage_side if int(t/2.4)%2==0 else -self.engage_side
+        # Finish an isolated victim and avoid orbiting just outside our arc.
+        if w and w['kind']=='lightning' and hp>.48 and close<=1 and me['energy']>15 and d<125 and (not target or target['kind']=='mech'):
+            reach=w['stats'].get('range',45)
+            if d>reach*.82:
+                v=norm(nx-ny*side*.42,ny+nx*side*.42)
+                return norm(v[0]*.78+baseline[0]*.22,v[1]*.78+baseline[1]*.22)
+            if d<reach*.92 and d>reach*.45:
+                radial=clamp((d-reach*.66)/12,-1.3,1.3)
+                return norm(nx*radial-ny*side,ny*radial+nx*side)
+        # Don't kite a nearly dead opponent away from its dropped cubes.
+        if e.get('hp',1400)<160 and hp>.5 and close<=1 and 25<d<100 and (not obj or obj[3] not in ('cube','drop')):
+            return norm(nx*.65+baseline[0]*.35,ny*.65+baseline[1]*.35)
+        return baseline
+
+    def fight(self, obs, me, target, act, enemies, near, urgent):
+        super().fight(obs,me,target,act,enemies,near,urgent)
+        if target is None:return
+        w=me['weapons'][1]
+        # Stop distant, optional chip damage while recovery is feasible.
+        if self.heal_mode and near>125 and target['kind']!='mech' and not (self.new_objective and self.new_objective[3] in ('npc','crate') and d2(me['pos'],target['pos'])<45 and target.get('hp',999)<100):
+            act['fire']=[False,False]
+        if self.heal_mode and near>180 and target['kind']=='mech' and target.get('hp',1400)>230:
+            act['fire']=[False,False]
+        if w and w['kind']=='lightning' and self.visible_to_shoot(me,target):
+            # Check the actual arc at current/next torso orientation; don't
+            # spend energy on distant or occluded targets.
+            d=d2(me['pos'],target['pos'])
+            ang=math.atan2(target['pos'][1]-me['pos'][1],target['pos'][0]-me['pos'][0])
+            aim=act.get('aim',me['aim'])[0]
+            next_aim=me['aim'][0]+clamp(angle_delta(aim,me['aim'][0]),-me['stats'].get('turn_rate',4)*.05,me['stats'].get('turn_rate',4)*.05)
+            if d<w['stats'].get('range',45)-1 and abs(angle_delta(ang,next_aim))<math.radians(w['stats'].get('cone_deg',30))*.44 and me['energy']>=w['stats'].get('energy',3)+2:
+                act['fire'][1]=True
+
+    def act(self, obs):
+        me=obs['self'];t=obs['t']; hp=me['hp']/max(1,me['max_hp'])
+        enemies=sorted((e for e in obs['mechs'] if e['kind']=='mech'),key=lambda e:d2(me['pos'],e['pos']))
+        near=d2(me['pos'],enemies[0]['pos']) if enemies else 999
+        if any(e.get('type')=='damaged' for e in obs.get('events',[])):self.damage_clock=t
+        if hp<.48 and near>125:self.heal_mode=True
+        if hp>.79 or near<100 or not me['in_zone']:self.heal_mode=False
+        a=super().act(obs)
+        here=me['pos']; w=me['weapons'][1]; obj=self.new_objective
+        # Prefer a more effective secondary and protect weapon upgrade value.
+        if w and w.get('charge',0)<=0 and near>45:
+            old=self.utility(w['kind'],me,near,obs['alive'])
+            choices=[p for p in obs.get('pickups',[]) if p['kind'] not in ('gun',w['kind']) and d2(here,p['pos'])<=self.config['loot']['pickup_radius']-.2 and abs(here[2]-p['pos'][2])<=3.5 and self.utility(p['kind'],me,near,obs['alive'])>old+23]
+            if choices:
+                best=max(choices,key=lambda p:self.utility(p['kind'],me,near,obs['alive']))
+                a['take']=best['id'];a['drop']=1
+            elif a.get('drop')==1:
+                p=next((p for p in obs.get('pickups',[]) if p['id']==a.get('take')),None)
+                if p and self.utility(p['kind'],me,near,obs['alive'])<old+12:
+                    a.pop('take',None);a.pop('drop',None)
+        if obj and obj[3] in ('cube','weapon','drop') and me['in_zone']:
+            d=d2(here,obj[2]); x,y=here[:2]; vx,vy=me['vel'][:2]
+            # Decelerate toward loot so inertia doesn't carry us outside the
+            # collection radius, and stay in supply rings until captured.
+            if d<11 and near>30 and (not self.nav.ok or self.nav.clear(here,obj[2])):
+                stop=1.4 if obj[3]!='drop' else 2.4
+                dx,dy=norm(obj[2][0]-x,obj[2][1]-y)
+                mag=clamp((d-stop)/5,0,1)
+                a['move']=[dx*mag,dy*mag];a['boost']=False
+                if d<5 and obj[3]=='drop':a['move']=[0.,0.]
+        if w and w['kind']=='lightning' and near<125 and near>w['stats'].get('range',45)*.86 and hp>.60 and me['energy']>65 and me['grounded'] and sum(d2(here,e['pos'])<95 for e in enemies)<=1:
+            # Short gap-closing burst. Keep energy for sustained lightning.
+            e=enemies[0]; dx,dy=norm(e['pos'][0]-here[0],e['pos'][1]-here[1]); mx,my=a.get('move',[0,0])
+            if dx*mx+dy*my>.45:a['boost']=True
+        return a
+
+
+Bot = V7Bot
 
 mf.run(Bot)
