@@ -1220,4 +1220,100 @@ class V9Bot(V8Bot):
         return norm(sx*mix+moving[0]*(1-mix),sy*mix+moving[1]*(1-mix))
 
 Bot=V9Bot
+
+# V10: fix objective tracking and endpoint handling. The combat policy is V9.
+class V10Bot(V9Bot):
+    name = 'Bizz01-Aegis-v10'
+
+    def __init__(self, hello):
+        super().__init__(hello)
+        self.loot_memory = {'cubes': {}, 'pickups': {}}
+        self.objective_key = None
+        self.actual_goal = None
+        self.capture_lock = None
+
+    def remembered_loot(self, obs, me):
+        # Only remember positions of objects actually seen. Never fire at or
+        # attempt to take a remembered object without a current observation.
+        t = obs['t']; here = me['pos']; result = dict(obs)
+        near = self.config.get('vision', {}).get('near_range',45) + me['stats'].get('near_range_bonus',0)
+        for field, life in (('cubes', 8.), ('pickups', 9.)):
+            mem = self.loot_memory[field]
+            live = {p['id']: p for p in obs.get(field,[])}
+            for ident,p in live.items(): mem[ident] = (t,p.copy())
+            extras=[]
+            for ident,(seen,p) in list(mem.items()):
+                if ident in live: continue
+                d=d2(here,p['pos'])
+                # Missing inside proximity vision with a line of sight means
+                # collected or gone. Also forget stale or distant objects.
+                if t-seen>life or t<seen or d>190 or (d<near-3 and self.sight.clear(
+                    (here[0],here[1],here[2]+me['stats'].get('eye_height',8)),
+                    (p['pos'][0],p['pos'][1],p['pos'][2]+1))):
+                    del mem[ident]
+                else: extras.append((d,p))
+            extras.sort(key=lambda row:row[0]); result[field]=list(live.values())+[p for _,p in extras[:5]]
+        return result
+
+    def choose_objective(self, obs, me, enemies, near, zone_urgent):
+        expanded=self.remembered_loot(obs,me)
+        chosen=super().choose_objective(expanded,me,enemies,near,zone_urgent)
+        # Preserve a nearly-completed uncontested capture. A full heal and
+        # three cubes are more valuable than chasing an unrelated pickup.
+        self.capture_lock=None
+        if not zone_urgent:
+            for drop in obs.get('drops',[]):
+                if drop.get('holder')!=me['id'] or drop.get('lands_in',1)>0: continue
+                d=d2(me['pos'],drop['pos'])
+                if d>drop.get('radius',8)-.7 or near<55: continue
+                if d2(drop['pos'],obs['zone']['center'])>obs['zone']['radius']-4: continue
+                if d2(drop['pos'],obs['zone']['next_center'])>obs['zone']['next_radius']-4 and obs['zone']['shrink_end']-obs['t']<12:continue
+                chosen=(1000,drop['id'],tuple(drop['pos'][:2]),'drop',None)
+                self.new_objective=chosen;self.farm_focus=drop['id'];self.capture_lock=drop['id'];break
+        key=(chosen[1],chosen[3]) if chosen else None
+        if key!=self.objective_key:
+            self.route_path=[];self.route_goal=None;self.objective_key=key
+        return chosen
+
+    def route_move(self, here, goal, enemies, t):
+        self.actual_goal=tuple(goal)
+        # A direct lane to the current goal always takes precedence over an
+        # old cached path, especially for two pickups only a few metres apart.
+        if d2(here,goal)<85 and self.nav.clear(here,goal):
+            self.route_goal=goal;self.route_path=[goal];self.route_at=t
+            return norm(goal[0]-here[0],goal[1]-here[1]),goal
+        if self.route_goal is not None and self.new_objective and d2(self.new_objective[2],goal)<.01 and d2(goal,self.route_goal)>4:
+            self.route_path=[];self.route_goal=None
+        return super().route_move(here,goal,enemies,t)
+
+    def choose_target(self, obs, me, enemies, objective, near):
+        # Do not prefer a weak but out-of-range enemy over one we can damage.
+        reach=0.
+        for w in me['weapons']:
+            if not w:continue
+            st=w['stats'];reach=max(reach,st.get('range', 230 if w['kind']=='mortar' else 0))
+        viable=[e for e in enemies if d2(me['pos'],e['pos'])<reach-2 and self.visible_to_shoot(me,e)]
+        return super().choose_target(obs,me,viable if viable else enemies,objective,near)
+
+    def act(self, obs):
+        a=super().act(obs); me=obs['self'];o=self.new_objective
+        if not o or not me['grounded'] or not self.actual_goal or d2(o[2],self.actual_goal)>.1:return a
+        near=min((d2(me['pos'],e['pos']) for e in obs['mechs'] if e['kind']=='mech'),default=999)
+        d=d2(me['pos'],o[2]); k=o[3]
+        # Brake around the exact endpoint rather than boost past it. No
+        # adjustment when combat is too close or while escaping the zone.
+        if me['in_zone'] and near>45 and k in ('cube','weapon','drop') and d<12 and self.nav.clear(me['pos'],o[2]):
+            if self.capture_lock is not None or (k=='drop' and d<3.2):
+                a['move']=[0.,0.];a['boost']=False
+            elif d>3.0:
+                dx,dy=norm(o[2][0]-me['pos'][0],o[2][1]-me['pos'][1]);speed=clamp((d-2.)/6.,.25,1.)
+                a['move']=[dx*speed,dy*speed];a['boost']=False
+            else:a['boost']=False
+        # Never jump out of an uncontested capture ring just because a stale
+        # navigation rescue timer is running.
+        if self.capture_lock is not None and near>=55 and me['in_zone']:
+            a['move']=[0.,0.];a['boost']=False;a['jump']=False
+        return a
+
+Bot=V10Bot
 mf.run(Bot)
