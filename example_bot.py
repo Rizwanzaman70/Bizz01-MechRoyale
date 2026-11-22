@@ -1184,5 +1184,40 @@ class V8Bot(V6Bot):
             if me['energy']<45:action['boost']=False
         return action
 
-Bot=V8Bot
+
+# Selected policy: retain V8 weapon handling and loot decisions.
+class V9Bot(V8Bot):
+    name="Bizz01-Aegis-v9"
+    ranges=(100,130,30,135)
+    strafe=1.0
+    period=1.4
+    blend=.90
+    def combat_move(self,me,enemies,target,moving,urgent,t):
+        if urgent or not enemies:return moving
+        here=me['pos'];near=d2(here,enemies[0]['pos']);hp=me['hp']/max(1,me['max_hp']);obj=self.new_objective
+        if near>180:return moving
+        if obj and obj[3] in ('cube','weapon','drop') and d2(here,obj[2])<25 and near>32:return moving
+        e=target if target and target['kind']=='mech' else enemies[0];dd=d2(here,e['pos']);w=me['weapons'][1];k=w['kind'] if w else 'gun';ideal=self.ranges[('gun','laser','lightning','mortar').index(k)]
+        # Weapon matchup and enemy count: stay out of lightning when not using it.
+        if 'lightning' in e.get('weapons',[]) and k!='lightning':ideal=max(ideal,62)
+        close=sum(d2(here,p['pos'])<100 for p in enemies)
+        if close>=2 and k!='lightning':ideal=max(ideal,105)
+        if hp<.30:ideal=max(ideal,110)
+        if e.get('hp',1400)<130 and hp>.40 and close<2:ideal=min(ideal,45)
+        nx,ny=norm(e['pos'][0]-here[0],e['pos'][1]-here[1]);rad=clamp((dd-ideal)/28,-1.8,1.45)
+        side=self.orbit_dir*(1 if int((t+.31)/self.period)%2==0 else -1)
+        # When lightning needs range, favor forward movement over sideways motion.
+        lateral=self.strafe*(.40 if k=='lightning' and dd>ideal+12 else 1)
+        sx,sy=norm(nx*rad-ny*side*lateral,ny*rad+nx*side*lateral)
+        if close>=2:
+            fx,fy=0.,0.
+            for p in enemies:
+                d=d2(here,p['pos'])
+                if d<95 and p['id']!=e['id']:
+                    ax,ay=norm(here[0]-p['pos'][0],here[1]-p['pos'][1]);weight=(95-d)/max(d,15);fx+=ax*weight;fy+=ay*weight
+            sx,sy=norm(sx+fx*.7,sy+fy*.7)
+        mix=clamp((190-near)/95,.25,self.blend)
+        return norm(sx*mix+moving[0]*(1-mix),sy*mix+moving[1]*(1-mix))
+
+Bot=V9Bot
 mf.run(Bot)
